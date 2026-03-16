@@ -12,18 +12,240 @@ if (!admin.apps.length) {
 
 const db = admin.firestore();
 
+const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
+
+const safeNumber = (value, fallback = 0) => {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : fallback;
+};
+
+const scoreGutHealth = (entry = {}) => {
+  const fiberGrams = safeNumber(entry.fiberGrams);
+  const probioticServings = safeNumber(entry.probioticServings);
+  const prebioticServings = safeNumber(entry.prebioticServings);
+  const processedFoodServings = safeNumber(entry.processedFoodServings);
+  const sugarGrams = safeNumber(entry.sugarGrams);
+  const waterMl = safeNumber(entry.waterMl);
+  const sleepHours = safeNumber(entry.sleepHours);
+  const stressLevel = clamp(safeNumber(entry.stressLevel, 5), 1, 10);
+  const symptoms = Array.isArray(entry.symptoms)
+    ? entry.symptoms.filter(Boolean).length
+    : safeNumber(entry.symptomCount);
+  const foods = Array.isArray(entry.foods) ? entry.foods.filter(Boolean) : [];
+
+  const uniqueFoods = new Set(foods.map((food) => String(food).trim().toLowerCase()).filter(Boolean)).size;
+
+  const components = {
+    fiber: clamp((fiberGrams / 30) * 25, 0, 25),
+    probiotics: clamp((probioticServings / 2) * 15, 0, 15),
+    prebiotics: clamp((prebioticServings / 2) * 15, 0, 15),
+    hydration: clamp((waterMl / 2500) * 10, 0, 10),
+    sleep: clamp((sleepHours / 8) * 10, 0, 10),
+    diversity: clamp((uniqueFoods / 12) * 15, 0, 15),
+    processedPenalty: clamp(processedFoodServings * 3, 0, 12),
+    sugarPenalty: clamp((sugarGrams / 10) * 2, 0, 12),
+    stressPenalty: clamp((stressLevel - 1) * 0.75, 0, 6.75),
+    symptomPenalty: clamp(symptoms * 2, 0, 20),
+  };
+
+  const positive =
+    components.fiber +
+    components.probiotics +
+    components.prebiotics +
+    components.hydration +
+    components.sleep +
+    components.diversity;
+
+  const penalties =
+    components.processedPenalty +
+    components.sugarPenalty +
+    components.stressPenalty +
+    components.symptomPenalty;
+
+  const score = clamp(Math.round(positive - penalties), 0, 100);
+
+  let status = 'Needs attention';
+  if (score >= 80) status = 'Excellent';
+  else if (score >= 60) status = 'Good';
+  else if (score >= 40) status = 'Fair';
+
+  return {
+    score,
+    status,
+    components,
+    insights: {
+      fiberTargetMet: fiberGrams >= 25,
+      hydrationTargetMet: waterMl >= 2000,
+      diversityTargetMet: uniqueFoods >= 10,
+      symptomCount: symptoms,
+      uniqueFoods,
+    },
+  };
+};
+
+const buildSummary = (docs) => {
+  if (!docs.length) {
+    return {
+      totals: { entries: 0 },
+      averages: { gutHealthScore: 0, symptomCount: 0 },
+      trend: 'no-data',
+      topTriggers: [],
+    };
+  }
+
+  const entries = docs.map((doc) => doc.data());
+  const totalScore = entries.reduce((sum, entry) => sum + safeNumber(entry.gutHealthScore), 0);
+  const totalSymptoms = entries.reduce((sum, entry) => sum + safeNumber(entry.symptomCount), 0);
+
+  const triggerCounts = entries.reduce((acc, entry) => {
+    const triggers = Array.isArray(entry.possibleTriggers) ? entry.possibleTriggers : [];
+    triggers.forEach((trigger) => {
+      const key = String(trigger || '').trim().toLowerCase();
+      if (!key) return;
+      acc[key] = (acc[key] || 0) + 1;
+    });
+    return acc;
+  }, {});
+
+  const topTriggers = Object.entries(triggerCounts)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 5)
+    .map(([trigger, count]) => ({ trigger, count }));
+
+  const first = entries[0]?.gutHealthScore || 0;
+  const last = entries[entries.length - 1]?.gutHealthScore || 0;
+  const trend = last > first ? 'improving' : last < first ? 'declining' : 'stable';
+
+  return {
+    totals: { entries: entries.length },
+    averages: {
+      gutHealthScore: Number((totalScore / entries.length).toFixed(1)),
+      symptomCount: Number((totalSymptoms / entries.length).toFixed(1)),
+    },
+    trend,
+    topTriggers,
+  };
+};
+
+const createGutLog = async (payload) => {
+  const userId = String(payload.userId || '').trim();
+  if (!userId) {
+    return { status: 400, body: { error: 'Missing userId' } };
+  }
+
+  const mealDate = payload.mealDate ? new Date(payload.mealDate) : new Date();
+  const symptoms = Array.isArray(payload.symptoms) ? payload.symptoms : [];
+
+  const scored = scoreGutHealth(payload);
+
+  const log = {
+    userId,
+    mealDate,
+    foods: Array.isArray(payload.foods) ? payload.foods : [],
+    symptoms,
+    symptomCount: symptoms.length,
+    possibleTriggers: Array.isArray(payload.possibleTriggers) ? payload.possibleTriggers : [],
+    notes: payload.notes || '',
+    metrics: {
+      fiberGrams: safeNumber(payload.fiberGrams),
+      probioticServings: safeNumber(payload.probioticServings),
+      prebioticServings: safeNumber(payload.prebioticServings),
+      processedFoodServings: safeNumber(payload.processedFoodServings),
+      sugarGrams: safeNumber(payload.sugarGrams),
+      waterMl: safeNumber(payload.waterMl),
+      sleepHours: safeNumber(payload.sleepHours),
+      stressLevel: clamp(safeNumber(payload.stressLevel, 5), 1, 10),
+    },
+    gutHealthScore: scored.score,
+    gutHealthStatus: scored.status,
+    scoreBreakdown: scored.components,
+    insights: scored.insights,
+    createdAt: admin.firestore.FieldValue.serverTimestamp(),
+  };
+
+  const ref = await db.collection('gutHealthLogs').add(log);
+
+  return {
+    status: 200,
+    body: {
+      status: 'success',
+      logId: ref.id,
+      gutHealthScore: scored.score,
+      gutHealthStatus: scored.status,
+      scoreBreakdown: scored.components,
+      insights: scored.insights,
+    },
+  };
+};
+
+const getGutSummary = async (payload) => {
+  const userId = String(payload.userId || '').trim();
+  if (!userId) {
+    return { status: 400, body: { error: 'Missing userId' } };
+  }
+
+  const days = clamp(parseInt(payload.days, 10) || 7, 1, 90);
+  const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+
+  const snapshot = await db
+    .collection('gutHealthLogs')
+    .where('userId', '==', userId)
+    .where('mealDate', '>=', since)
+    .orderBy('mealDate', 'asc')
+    .limit(200)
+    .get();
+
+  const summary = buildSummary(snapshot.docs);
+
+  const entries = snapshot.docs.map((doc) => {
+    const data = doc.data();
+    return {
+      id: doc.id,
+      mealDate: data.mealDate,
+      gutHealthScore: data.gutHealthScore,
+      gutHealthStatus: data.gutHealthStatus,
+      symptomCount: data.symptomCount,
+      possibleTriggers: data.possibleTriggers,
+      foods: data.foods,
+    };
+  });
+
+  return {
+    status: 200,
+    body: {
+      status: 'success',
+      windowDays: days,
+      summary,
+      entries,
+    },
+  };
+};
+
 module.exports = async (req, res) => {
-  if (req.method !== 'POST') {
-    return res.status(405).json({ error: 'Only POST allowed' });
+  if (req.method !== 'POST' && req.method !== 'GET') {
+    return res.status(405).json({ error: 'Only GET and POST allowed' });
   }
 
-  const { key, value } = req.body;
-
-  if (!key || value === undefined) {
-    return res.status(400).json({ error: 'Missing key or value' });
-  }
+  const payload = req.method === 'GET' ? req.query : req.body || {};
+  const action = payload.action || (req.method === 'GET' ? 'getGutSummary' : 'setSyncValue');
 
   try {
+    if (action === 'logGutEntry') {
+      const result = await createGutLog(payload);
+      return res.status(result.status).json(result.body);
+    }
+
+    if (action === 'getGutSummary') {
+      const result = await getGutSummary(payload);
+      return res.status(result.status).json(result.body);
+    }
+
+    // Backwards-compatible key/value storage used by prior clients.
+    const { key, value } = payload;
+    if (!key || value === undefined) {
+      return res.status(400).json({ error: 'Missing key or value. For gut features use actions: logGutEntry/getGutSummary.' });
+    }
+
     await db.collection('syncData').doc(key).set({ value });
     return res.status(200).json({ status: 'success' });
   } catch (err) {
